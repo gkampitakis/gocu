@@ -1,0 +1,60 @@
+name: Go
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+    branches:
+      - main
+  push:
+    paths-ignore:
+      - "**/*.md"
+    branches:
+      - main
+
+jobs:
+  lint:
+    name: Run linting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: "latest"
+      - name: Format lint
+        run: |
+          make install-tools && make format && git diff && git diff --quiet
+
+  test:
+    name: Run tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - name: Set git to use LF
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+      - name: Setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      - name: Run Tests
+        run: make test
+
+  build:
+    name: Verify build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+      - name: go build
+        run: go build ./...
