@@ -1,5 +1,7 @@
 // Package proxy talks the Go module proxy protocol
-// (https://proxy.golang.org/) to discover module versions.
+// (https://proxy.golang.org/) to discover module versions. For "direct"
+// entries in GOPROXY (and modules matched by GOPRIVATE/GONOPROXY) it falls
+// back to a git-backed direct backend, see direct.go.
 package proxy
 
 import (
@@ -20,8 +22,10 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // ErrPrivate is returned when a module matches GOPRIVATE/GONOPROXY and the
-// caller asked the proxy to fetch it anyway.
-var ErrPrivate = errors.New("module is private (GOPRIVATE/GONOPROXY)")
+// configured GOPROXY has no "direct" entry to fall back on.
+var ErrPrivate = errors.New(
+	"module is private (GOPRIVATE/GONOPROXY) and no direct entry in GOPROXY",
+)
 
 // Info is the decoded response of {module}/@v/{version}.info or /@latest.
 type Info struct {
@@ -29,14 +33,17 @@ type Info struct {
 	Time    time.Time
 }
 
-// Client is a goroutine-safe GOPROXY HTTP client with an in-memory cache.
+// Client is a goroutine-safe GOPROXY client with an in-memory cache. It
+// dispatches each lookup along the GOPROXY chain, using HTTP for normal
+// entries and the git-backed direct backend for "direct" entries.
 type Client struct {
-	env  Env
-	http *http.Client
+	env    Env
+	http   *http.Client
+	direct *directBackend
 
 	mu       sync.Mutex
 	versions map[string][]string // module path -> versions list
-	info     map[string]Info     // "module@version" -> info
+	info     map[string]Info     // "module|key" -> info
 	infoErr  map[string]error    // negative cache for info
 }
 
@@ -49,6 +56,7 @@ func New(env Env) *Client {
 	return &Client{
 		env:      env,
 		http:     &http.Client{Timeout: 30 * time.Second},
+		direct:   newDirectBackend(),
 		versions: map[string][]string{},
 		info:     map[string]Info{},
 		infoErr:  map[string]error{},
@@ -65,16 +73,169 @@ func (c *Client) List(ctx context.Context, modulePath string) ([]string, error) 
 	}
 	c.mu.Unlock()
 
-	if c.env.IsPrivate(modulePath) {
-		return nil, ErrPrivate
+	versions, err := c.dispatchList(ctx, modulePath)
+	if err != nil {
+		return nil, err
 	}
 
+	c.mu.Lock()
+	c.versions[modulePath] = versions
+	c.mu.Unlock()
+	return versions, nil
+}
+
+// Latest returns the proxy's notion of "latest" for modulePath. For HTTP
+// proxies this hits /@latest; for direct entries it picks the highest
+// non-prerelease semver tag.
+func (c *Client) Latest(ctx context.Context, modulePath string) (Info, error) {
+	return c.cachedInfo(ctx, modulePath, "", "@latest")
+}
+
+// Info returns the version metadata for one specific version.
+func (c *Client) Info(ctx context.Context, modulePath, version string) (Info, error) {
+	return c.cachedInfo(ctx, modulePath, version, "info:"+version)
+}
+
+func (c *Client) cachedInfo(
+	ctx context.Context,
+	modulePath, version, cacheKey string,
+) (Info, error) {
+	key := modulePath + "|" + cacheKey
+	c.mu.Lock()
+	if i, ok := c.info[key]; ok {
+		c.mu.Unlock()
+		return i, nil
+	}
+	if e, ok := c.infoErr[key]; ok {
+		c.mu.Unlock()
+		return Info{}, e
+	}
+	c.mu.Unlock()
+
+	info, err := c.dispatchInfo(ctx, modulePath, version)
+
+	c.mu.Lock()
+	if err != nil {
+		c.infoErr[key] = err
+	} else {
+		c.info[key] = info
+	}
+	c.mu.Unlock()
+	return info, err
+}
+
+// effectiveChain returns the GOPROXY entries usable for modulePath. For
+// private modules, HTTP entries are filtered out (mirroring `go mod`'s
+// behavior) so only "direct"/"off" survive.
+func (c *Client) effectiveChain(modulePath string) []ProxyEntry {
+	if !c.env.IsPrivate(modulePath) {
+		return c.env.Proxies
+	}
+	out := make([]ProxyEntry, 0, len(c.env.Proxies))
+	for _, p := range c.env.Proxies {
+		if p.URL == "direct" || p.URL == "off" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (c *Client) dispatchList(ctx context.Context, modulePath string) ([]string, error) {
+	entries := c.effectiveChain(modulePath)
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%w; add ',direct' to GOPROXY to enable git fetch", ErrPrivate)
+	}
+
+	lastErr := ErrNotFound
+	for _, p := range entries {
+		switch p.URL {
+		case "off":
+			return nil, errors.New("GOPROXY=off")
+		case "direct":
+			versions, err := c.direct.list(ctx, modulePath)
+			if err == nil {
+				return versions, nil
+			}
+			lastErr = err
+			if !p.FallbackOnNotFound {
+				return nil, lastErr
+			}
+		default:
+			versions, err := c.httpList(ctx, p, modulePath)
+			if err == nil {
+				return versions, nil
+			}
+			if errors.Is(err, ErrNotFound) {
+				lastErr = ErrNotFound
+				if !p.FallbackOnNotFound {
+					return nil, ErrNotFound
+				}
+				continue
+			}
+			// Transport / 5xx error: comma falls through, pipe doesn't.
+			lastErr = err
+			if !p.FallbackOnNotFound {
+				return nil, lastErr
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func (c *Client) dispatchInfo(ctx context.Context, modulePath, version string) (Info, error) {
+	entries := c.effectiveChain(modulePath)
+	if len(entries) == 0 {
+		return Info{}, fmt.Errorf("%w; add ',direct' to GOPROXY to enable git fetch", ErrPrivate)
+	}
+
+	lastErr := ErrNotFound
+	for _, p := range entries {
+		switch p.URL {
+		case "off":
+			return Info{}, errors.New("GOPROXY=off")
+		case "direct":
+			info, err := c.directInfo(ctx, modulePath, version)
+			if err == nil {
+				return info, nil
+			}
+			lastErr = err
+			if !p.FallbackOnNotFound {
+				return Info{}, lastErr
+			}
+		default:
+			info, err := c.httpInfo(ctx, p, modulePath, version)
+			if err == nil {
+				return info, nil
+			}
+			if errors.Is(err, ErrNotFound) {
+				lastErr = ErrNotFound
+				if !p.FallbackOnNotFound {
+					return Info{}, ErrNotFound
+				}
+				continue
+			}
+			lastErr = err
+			if !p.FallbackOnNotFound {
+				return Info{}, lastErr
+			}
+		}
+	}
+	return Info{}, lastErr
+}
+
+func (c *Client) directInfo(ctx context.Context, modulePath, version string) (Info, error) {
+	if version == "" {
+		return c.direct.latest(ctx, modulePath)
+	}
+	return c.direct.info(ctx, modulePath, version)
+}
+
+func (c *Client) httpList(ctx context.Context, p ProxyEntry, modulePath string) ([]string, error) {
 	esc, err := module.EscapePath(modulePath)
 	if err != nil {
 		return nil, fmt.Errorf("escape %q: %w", modulePath, err)
 	}
-
-	body, err := c.fetch(ctx, esc+"/@v/list")
+	body, err := c.httpFetch(ctx, p, esc+"/@v/list")
 	if err != nil {
 		return nil, err
 	}
@@ -91,56 +252,31 @@ func (c *Client) List(ctx context.Context, modulePath string) ([]string, error) 
 			versions = append(versions, line)
 		}
 	}
-
-	c.mu.Lock()
-	c.versions[modulePath] = versions
-	c.mu.Unlock()
 	return versions, nil
 }
 
-// Latest returns the proxy's notion of "latest" for modulePath. This usually
-// resolves to the highest semver release tag, with the proxy applying its own
-// rules for prereleases and incompatible versions.
-func (c *Client) Latest(ctx context.Context, modulePath string) (Info, error) {
-	return c.fetchInfo(ctx, modulePath, "@latest")
-}
-
-// Info returns the version metadata for one specific version.
-func (c *Client) Info(ctx context.Context, modulePath, version string) (Info, error) {
-	esc, err := module.EscapeVersion(version)
-	if err != nil {
-		return Info{}, fmt.Errorf("escape version %q: %w", version, err)
-	}
-	return c.fetchInfo(ctx, modulePath, "@v/"+esc+".info")
-}
-
-func (c *Client) fetchInfo(ctx context.Context, modulePath, suffix string) (Info, error) {
-	key := modulePath + "|" + suffix
-	c.mu.Lock()
-	if i, ok := c.info[key]; ok {
-		c.mu.Unlock()
-		return i, nil
-	}
-	if e, ok := c.infoErr[key]; ok {
-		c.mu.Unlock()
-		return Info{}, e
-	}
-	c.mu.Unlock()
-
-	if c.env.IsPrivate(modulePath) {
-		return Info{}, ErrPrivate
-	}
-
+func (c *Client) httpInfo(
+	ctx context.Context,
+	p ProxyEntry,
+	modulePath, version string,
+) (Info, error) {
 	esc, err := module.EscapePath(modulePath)
 	if err != nil {
 		return Info{}, fmt.Errorf("escape %q: %w", modulePath, err)
 	}
+	var path string
+	if version == "" {
+		path = esc + "/@latest"
+	} else {
+		vesc, err := module.EscapeVersion(version)
+		if err != nil {
+			return Info{}, fmt.Errorf("escape version %q: %w", version, err)
+		}
+		path = esc + "/@v/" + vesc + ".info"
+	}
 
-	body, err := c.fetch(ctx, esc+"/"+suffix)
+	body, err := c.httpFetch(ctx, p, path)
 	if err != nil {
-		c.mu.Lock()
-		c.infoErr[key] = err
-		c.mu.Unlock()
 		return Info{}, err
 	}
 	defer body.Close()
@@ -149,58 +285,33 @@ func (c *Client) fetchInfo(ctx context.Context, modulePath, suffix string) (Info
 	if err := json.NewDecoder(body).Decode(&info); err != nil {
 		return Info{}, fmt.Errorf("decode info: %w", err)
 	}
-
-	c.mu.Lock()
-	c.info[key] = info
-	c.mu.Unlock()
 	return info, nil
 }
 
-// fetch walks the GOPROXY chain trying each entry until one returns the path
-// or all are exhausted. "direct" and "off" entries terminate the chain.
-func (c *Client) fetch(ctx context.Context, path string) (io.ReadCloser, error) {
-	lastErr := ErrNotFound
-	for _, p := range c.env.Proxies {
-		switch p.URL {
-		case "off":
-			return nil, errors.New("GOPROXY=off")
-		case "direct":
-			return nil, errors.New("GOPROXY=direct not supported (proxy required)")
-		}
-
-		req, err := http.NewRequestWithContext(
-			ctx,
-			"GET",
-			strings.TrimRight(p.URL, "/")+"/"+path,
-			nil,
-		)
-		if err != nil {
-			return nil, err
-		}
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue // transport error -> always fall through
-		}
-		switch resp.StatusCode {
-		case 200:
-			return resp.Body, nil
-		case 404, 410:
-			resp.Body.Close()
-			lastErr = ErrNotFound
-			if p.FallbackOnNotFound {
-				continue
-			}
-			return nil, ErrNotFound
-		default:
-			resp.Body.Close()
-			lastErr = fmt.Errorf("proxy %s: HTTP %d", p.URL, resp.StatusCode)
-			// Non-404 server errors: only retry if comma-separated.
-			if p.FallbackOnNotFound {
-				continue
-			}
-			return nil, lastErr
-		}
+// httpFetch performs a single GET against one HTTP proxy entry, translating
+// HTTP status into ErrNotFound (404/410) or a typed error.
+func (c *Client) httpFetch(ctx context.Context, p ProxyEntry, path string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		"GET",
+		strings.TrimRight(p.URL, "/")+"/"+path,
+		nil,
+	)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	switch resp.StatusCode {
+	case 200:
+		return resp.Body, nil
+	case 404, 410:
+		resp.Body.Close()
+		return nil, ErrNotFound
+	default:
+		resp.Body.Close()
+		return nil, fmt.Errorf("proxy %s: HTTP %d", p.URL, resp.StatusCode)
+	}
 }
