@@ -174,6 +174,66 @@ func TestClient_Private(t *testing.T) {
 	}
 }
 
+// When a private module has "direct" in GOPROXY, the chain skips HTTP and
+// routes the request to the direct backend instead of returning ErrPrivate.
+func TestClient_Private_FallsThroughToDirect(t *testing.T) {
+	httpHit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		httpHit = true
+	}))
+	defer srv.Close()
+
+	c := New(Env{
+		Proxies: []ProxyEntry{
+			{URL: srv.URL, FallbackOnNotFound: true},
+			{URL: "direct", FallbackOnNotFound: true},
+		},
+		Private: "github.com/secret/*",
+	})
+	c.direct.runGit = func(_ context.Context, _ string, args ...string) (string, error) {
+		if !strings.HasPrefix(strings.Join(args, " "), "ls-remote") {
+			t.Fatalf("unexpected git call: %v", args)
+		}
+		return "abc\trefs/tags/v1.0.0\n", nil
+	}
+
+	versions, err := c.List(context.Background(), "github.com/secret/mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 || versions[0] != "v1.0.0" {
+		t.Errorf("versions = %v, want [v1.0.0]", versions)
+	}
+	if httpHit {
+		t.Error("HTTP proxy should not have been hit for a private module")
+	}
+}
+
+// A non-private module that 404s on the HTTP proxy should fall through to
+// direct (with the default comma separator), which now actually resolves.
+func TestClient_FallsThroughToDirect_OnNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := New(Env{Proxies: []ProxyEntry{
+		{URL: srv.URL, FallbackOnNotFound: true},
+		{URL: "direct", FallbackOnNotFound: true},
+	}})
+	c.direct.runGit = func(_ context.Context, _ string, args ...string) (string, error) {
+		return "abc\trefs/tags/v1.0.0\n", nil
+	}
+
+	versions, err := c.List(context.Background(), "github.com/foo/bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions) != 1 || versions[0] != "v1.0.0" {
+		t.Errorf("versions = %v, want [v1.0.0]", versions)
+	}
+}
+
 func TestParseGOPROXY(t *testing.T) {
 	cases := []struct {
 		in   string
